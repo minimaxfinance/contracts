@@ -8,8 +8,3 @@ interface IMasterChef {
     // Withdraw '_amount' of stakedToken and all pending rewardToken tokens
     function leaveStaking(uint256 _amount) external;
 }
-
-abstract contract MasterChef is IMasterChef {
-    event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
-    event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
-}

@@ -3,11 +3,11 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "./helpers/SafeBEP20.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 
 contract MinimaxVesting is OwnableUpgradeable {
-    using SafeBEP20 for IBEP20;
-    using SafeMath for uint256;
+    using SafeERC20Upgradeable for IERC20Upgradeable;
 
     event Released(address token, uint256 amount);
 
@@ -82,7 +82,7 @@ contract MinimaxVesting is OwnableUpgradeable {
         _bep20Released[token] += releasable;
         emit Released(token, releasable);
         if (releasable > 0) {
-            IBEP20(token).safeTransfer(beneficiary(), releasable);
+            IERC20Upgradeable(token).safeTransfer(beneficiary(), releasable);
         }
     }
 
@@ -91,7 +91,7 @@ contract MinimaxVesting is OwnableUpgradeable {
      * Default implementation is a batching vesting strategy.
      */
     function vestedAmount(address token, uint64 timestamp) public view returns (uint256) {
-        return _vestingSchedule(IBEP20(token).balanceOf(address(this)) + released(token), timestamp);
+        return _vestingSchedule(IERC20Upgradeable(token).balanceOf(address(this)) + released(token), timestamp);
     }
 
     /**
@@ -106,8 +106,8 @@ contract MinimaxVesting is OwnableUpgradeable {
             return totalAllocation;
         } else {
             uint64 timeDiff = timestamp - uint64(start());
-            uint64 totalBatchesPassed = uint64(uint256(timeDiff).mul(batches()).div(duration()));
-            return totalAllocation.div(batches()).mul(totalBatchesPassed);
+            uint64 totalBatchesPassed = uint64((uint256(timeDiff) * batches()) / duration());
+            return (totalAllocation / batches()) * totalBatchesPassed;
         }
     }
 }

@@ -3,58 +3,102 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "./helpers/SafeBEP20.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "./helpers/Math.sol";
+import "./interfaces/IMinimaxStaking.sol";
 import "./MinimaxStaking.sol";
+import "./pool/IPoolAdapter.sol";
+import "./interfaces/IERC20Decimals.sol";
 import "./interfaces/IPriceOracle.sol";
 import "./interfaces/IPancakeRouter.sol";
-import "./interfaces/ISmartChefInitializable.sol";
+import "./interfaces/ISmartChef.sol";
+import "./interfaces/IGelatoOps.sol";
+import "./interfaces/IWrapped.sol";
 import "./ProxyCaller.sol";
+import "./ProxyCallerApi.sol";
+import "./ProxyPool.sol";
+import "./market/Market.sol";
+import "./PositionInfo.sol";
+import "./PositionExchangeLib.sol";
+import "./PositionBalanceLib.sol";
+import "./PositionLib.sol";
+import "./interfaces/IMinimaxMain.sol";
+import "./market/v2/IPairToken.sol";
 
 /*
     MinimaxMain
 */
-contract MinimaxMain is OwnableUpgradeable, ReentrancyGuardUpgradeable {
-    address public cakeAddress; // "0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82"
-    address public cakeOracleAddress; // "0xb6064ed41d4f67e353768aa239ca86f4f73665a1"
-    address public busdAddress; // "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56"
-    address public cakeRouterAddress; // "0x10ED43C718714eb63d5aA57B78B54704E256024E"
-    address public minimaxStaking;
+contract MinimaxMain is IMinimaxMain, OwnableUpgradeable, ReentrancyGuardUpgradeable {
+    // -----------------------------------------------------------------------------------------------------------------
+    // Using declarations.
+
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    using ProxyCallerApi for ProxyCaller;
+
+    using ProxyPool for ProxyCaller[];
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // Enums.
+
+    enum ClosePositionReason {
+        WithdrawnByOwner,
+        LiquidatedByAutomation
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // Events.
+
+    // NB: If `estimatedStakedTokenPrice` is equal to `0`, then the price is unavailable for some reason.
 
     event PositionWasCreated(uint indexed positionIndex);
+    event PositionWasCreatedV2(
+        uint indexed positionIndex,
+        uint timestamp,
+        uint stakedTokenPrice,
+        uint8 stakedTokenPriceDecimals
+    );
+
     event PositionWasModified(uint indexed positionIndex);
+
     event PositionWasClosed(uint indexed positionIndex);
+    event PositionWasClosedV2(
+        uint indexed positionIndex,
+        uint timestamp,
+        uint stakedTokenPrice,
+        uint8 stakedTokenPriceDecimals
+    );
+
+    event PositionWasLiquidatedV2(
+        uint indexed positionIndex,
+        uint timestamp,
+        uint stakedTokenPrice,
+        uint8 stakedTokenPriceDecimals
+    );
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // Storage.
 
     uint public constant FEE_MULTIPLIER = 1e8;
     uint public constant SLIPPAGE_MULTIPLIER = 1e8;
-    // From chainlink price oracle (decimals)
-    uint public constant PRICE_MULTIPLIER = 1e8;
+    uint public constant POSITION_PRICE_LIMITS_MULTIPLIER = 1e8;
 
-    struct PositionInfo {
-        uint stakedAmount;
-        uint feeAmount;
-        uint stopLossPrice;
-        uint maxSlippage;
-        address poolAddress;
-        address owner;
-        address rewardToken;
-        address callerAddress;
-        bool closed;
-        uint takeProfitPrice;
-    }
+    address public cakeAddress; // TODO: remove when deploy clean version
 
-    uint lastPositionIndex;
+    // BUSD for BSC, USDT for POLYGON
+    address public busdAddress; // TODO: rename to stableToken when deploy clean version
 
-    // Not an array for upgradability of PositionInfo struct
+    address public minimaxStaking;
+
+    uint public lastPositionIndex;
+
+    // Use mapping instead of array for upgradeability of PositionInfo struct
     mapping(uint => PositionInfo) public positions;
+
     mapping(address => bool) public isLiquidator;
 
-    bytes4 private constant ENTER_STAKING_SELECTOR = bytes4(keccak256("enterStaking(uint256)"));
-    bytes4 private constant LEAVE_STAKING_SELECTOR = bytes4(keccak256("leaveStaking(uint256)"));
-    bytes4 private constant DEPOSIT_SELECTOR = bytes4(keccak256("deposit(uint256)"));
-    bytes4 private constant WITHDRAW_SELECTOR = bytes4(keccak256("withdraw(uint256)"));
-    bytes4 private constant APPROVE_SELECTOR = bytes4(keccak256("approve(address,uint256)"));
-
-    address[] private availableCallers;
+    ProxyCaller[] public proxyPool;
 
     // Fee threshold
     struct FeeThreshold {
@@ -64,36 +108,128 @@ contract MinimaxMain is OwnableUpgradeable, ReentrancyGuardUpgradeable {
 
     FeeThreshold[] public depositFees;
 
-    address masterChefAddress; // "0x73feaa1eE314F8c655E354234017bE2193C9E24E"
+    /// @custom:oz-renamed-from poolAdapters
+    mapping(address => IPoolAdapter) public poolAdaptersDeprecated;
 
-    mapping(address => bool) public smartChefPools;
+    mapping(IERC20Upgradeable => IPriceOracle) public priceOracles;
 
-    bytes4 private constant TRANSFER_SELECTOR = bytes4(keccak256("transfer(address,uint256)"));
+    // TODO: deprecated
+    mapping(address => address) public tokenExchanges;
 
-    // Storage section ends!
+    // gelato
+    IGelatoOps public gelatoOps;
 
-    modifier onlyLiquidator() {
-        require(isLiquidator[address(msg.sender)], "only one of liquidators can close positions");
+    address payable public gelatoPayee;
+
+    mapping(address => uint256) public gelatoLiquidateFee; // TODO: remove when deploy clean version
+    uint256 public stakeGelatoFee; // TODO: rename to stakeGelatoFee
+    address public gelatoFeeToken; // TODO: remove when deploy clean version
+
+    // TODO: deprecated
+    address public defaultExchange;
+
+    // poolAdapters by bytecode hash
+    mapping(uint256 => IPoolAdapter) public poolAdapters;
+
+    IMarket public market;
+
+    address public wrappedNative;
+
+    address public oneInchRouter;
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // Methods.
+
+    function setGasTankThreshold(uint256 value) external onlyOwner {
+        stakeGelatoFee = value;
+    }
+
+    function setGelatoOps(address _gelatoOps) external onlyOwner {
+        gelatoOps = IGelatoOps(_gelatoOps);
+    }
+
+    function setLastPositionIndex(uint newLastPositionIndex) external onlyOwner {
+        require(newLastPositionIndex >= lastPositionIndex, "last position index may only be increased");
+        lastPositionIndex = newLastPositionIndex;
+    }
+
+    function getPoolAdapterKey(address pool) public view returns (uint256) {
+        return uint256(keccak256(pool.code));
+    }
+
+    function getPoolAdapter(address pool) public view returns (IPoolAdapter) {
+        uint256 key = getPoolAdapterKey(pool);
+        return poolAdapters[key];
+    }
+
+    function getPoolAdapterSafe(address pool) public view returns (IPoolAdapter) {
+        IPoolAdapter adapter = getPoolAdapter(pool);
+        require(address(adapter) != address(0), "pool adapter not found");
+        return adapter;
+    }
+
+    function getPoolAdapters(address[] calldata pools)
+        public
+        view
+        returns (IPoolAdapter[] memory adapters, uint256[] memory keys)
+    {
+        adapters = new IPoolAdapter[](pools.length);
+        keys = new uint256[](pools.length);
+        for (uint i = 0; i < pools.length; i++) {
+            uint256 key = getPoolAdapterKey(pools[i]);
+            keys[i] = key;
+            adapters[i] = poolAdapters[key];
+        }
+    }
+
+    // Staking pool adapters
+    function setPoolAdapters(address[] calldata pools, IPoolAdapter[] calldata adapters) external onlyOwner {
+        require(pools.length == adapters.length, "pools and adapters parameters should have the same length");
+        for (uint32 i = 0; i < pools.length; i++) {
+            uint256 key = getPoolAdapterKey(pools[i]);
+            poolAdapters[key] = adapters[i];
+        }
+    }
+
+    // Price oracles
+    function setPriceOracles(IERC20Upgradeable[] calldata tokens, IPriceOracle[] calldata oracles) external onlyOwner {
+        require(tokens.length == oracles.length, "tokens and oracles parameters should have the same length");
+        for (uint32 i = 0; i < tokens.length; i++) {
+            priceOracles[tokens[i]] = oracles[i];
+        }
+    }
+
+    function getPriceOracleSafe(IERC20Upgradeable token) public view returns (IPriceOracle) {
+        IPriceOracle oracle = priceOracles[token];
+        require(address(oracle) != address(0), "price oracle not found");
+        return oracle;
+    }
+
+    function setMarket(IMarket _market) external onlyOwner {
+        market = _market;
+    }
+
+    function setWrappedNative(address _native) external onlyOwner {
+        wrappedNative = _native;
+    }
+
+    function setOneInchRouter(address _router) external onlyOwner {
+        oneInchRouter = _router;
+    }
+
+    modifier onlyAutomator() {
+        require(msg.sender == address(gelatoOps) || isLiquidator[address(msg.sender)], "onlyAutomator");
         _;
     }
 
-    using SafeBEP20 for IBEP20;
-    using SafeMath for uint;
-
     function initialize(
         address _minimaxStaking,
-        address _cakeAddress,
-        address _cakeOracleAddress,
         address _busdAddress,
-        address _cakeRouterAddress,
-        address _masterChefAddress
+        address _gelatoOps
     ) external initializer {
         minimaxStaking = _minimaxStaking;
-        cakeAddress = _cakeAddress;
-        cakeOracleAddress = _cakeOracleAddress;
         busdAddress = _busdAddress;
-        cakeRouterAddress = _cakeRouterAddress;
-        masterChefAddress = _masterChefAddress;
+        gelatoOps = IGelatoOps(_gelatoOps);
 
         __Ownable_init();
         __ReentrancyGuard_init();
@@ -134,27 +270,18 @@ contract MinimaxMain is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         );
     }
 
-    // May run out of gas!
-    function setSmartChefPools(address[] calldata pools, bool[] calldata allowances) external onlyOwner {
-        for (uint i = 0; i < pools.length; i++) {
-            smartChefPools[pools[i]] = allowances[i];
-        }
-    }
+    receive() external payable {}
 
     function getSlippageMultiplier() public pure returns (uint) {
         return SLIPPAGE_MULTIPLIER;
     }
 
-    function getPriceMultiplier() public pure returns (uint) {
-        return PRICE_MULTIPLIER;
-    }
+    function getUserFee(address user) public view returns (uint) {
+        IMinimaxStaking staking = IMinimaxStaking(minimaxStaking);
 
-    function getUserFee() public view returns (uint) {
-        MinimaxStaking staking = MinimaxStaking(minimaxStaking);
-
-        uint amountPool2 = staking.getUserAmount(2, msg.sender);
-        uint amountPool3 = staking.getUserAmount(3, msg.sender);
-        uint totalStakedAmount = amountPool2.add(amountPool3);
+        uint amountPool2 = staking.getUserAmount(2, user);
+        uint amountPool3 = staking.getUserAmount(3, user);
+        uint totalStakedAmount = amountPool2 + amountPool3;
 
         uint length = depositFees.length;
 
@@ -164,23 +291,39 @@ contract MinimaxMain is OwnableUpgradeable, ReentrancyGuardUpgradeable {
                 return depositFees[bucketId].fee;
             }
         }
+
         return depositFees[length - 1].fee;
+    }
+
+    function getUserFeeAmount(address user, uint amount) public view returns (uint) {
+        uint userFeeShare = getUserFee(user);
+        return (amount * userFeeShare) / FEE_MULTIPLIER;
     }
 
     function getPositionInfo(uint positionIndex) external view returns (PositionInfo memory) {
         return positions[positionIndex];
     }
 
-    // May run out of gas if 'amount' is big
-    function addNewCallers(uint amount) external onlyOwner {
-        for (uint i = 0; i < amount; i++) {
-            ProxyCaller caller = new ProxyCaller();
-            availableCallers.push(address(caller));
-        }
+    function fillProxyPool(uint amount) external onlyOwner {
+        proxyPool.add(amount);
     }
 
-    function emergencyWithdrawCake(address to, uint cakeAmount) external onlyOwner {
-        IBEP20(cakeAddress).safeTransfer(to, cakeAmount);
+    function cleanProxyPool() external onlyOwner {
+        delete proxyPool;
+    }
+
+    function transferTo(
+        address token,
+        address to,
+        uint amount
+    ) external onlyOwner {
+        address nativeToken = address(0);
+        if (token == nativeToken) {
+            (bool success, ) = to.call{value: amount}("");
+            require(success, "transferTo: BNB transfer failed");
+        } else {
+            SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(token), to, amount);
+        }
     }
 
     function setDepositFee(uint poolIdx, uint feeShare) external onlyOwner {
@@ -188,98 +331,184 @@ contract MinimaxMain is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         depositFees[poolIdx].fee = feeShare;
     }
 
-    function setCakeOracleAddress(address oracleAddress) external onlyOwner {
-        cakeOracleAddress = oracleAddress;
-    }
-
-    function setCakeRouterAddress(address routerAddress) external onlyOwner {
-        cakeRouterAddress = routerAddress;
-    }
-
     function setMinimaxStakingAddress(address stakingAddress) external onlyOwner {
         minimaxStaking = stakingAddress;
     }
 
-    function setMasterChefAddress(address masterChefAddressVal) external onlyOwner {
-        masterChefAddress = masterChefAddressVal;
+    function getPositionBalances(uint[] calldata positionIndexes)
+        public
+        returns (PositionBalanceLib.PositionBalance[] memory)
+    {
+        return PositionBalanceLib.getMany(this, positions, positionIndexes);
     }
 
-    function stakeCake(
-        address poolAddress,
-        uint256 cakeAmount,
-        uint256 maxSlippage,
-        uint256 stopLossPrice,
-        uint256 takeProfitPrice
-    ) external nonReentrant returns (uint) {
-        emit PositionWasCreated(lastPositionIndex);
+    function _stakeToken(
+        PositionLib.StakeParams memory stakeParams,
+        uint swapKind,
+        bytes memory swapParams
+    ) private returns (uint) {
+        require(msg.value >= stakeGelatoFee, "gasTankThreshold");
 
-        require(stopLossPrice != 0, "stakeCake: stop-loss price is zero");
-        require(takeProfitPrice != 0, "stakeCake: take-profit price is zero");
-
-        bytes4 stakingSelector = DEPOSIT_SELECTOR;
-        address rewardToken = cakeAddress;
-        if (poolAddress == masterChefAddress) {
-            stakingSelector = ENTER_STAKING_SELECTOR;
-        } else {
-            require(smartChefPools[poolAddress], "stakeCake: got not allowed pool");
-            rewardToken = address(SmartChefInitializable(poolAddress).rewardToken());
-        }
-
-        address caller = getAvailableCaller();
-
-        IBEP20(cakeAddress).safeTransferFrom(address(msg.sender), address(this), cakeAmount);
-
-        uint userFeeShare = getUserFee();
-        uint userFeeAmount = cakeAmount.mul(userFeeShare).div(FEE_MULTIPLIER);
-        uint amountToStake = cakeAmount.sub(userFeeAmount);
-
+        uint positionIndex = lastPositionIndex;
         lastPositionIndex += 1;
 
-        positions[lastPositionIndex - 1] = PositionInfo({
-            stakedAmount: amountToStake,
-            feeAmount: userFeeAmount,
-            stopLossPrice: stopLossPrice,
-            maxSlippage: maxSlippage,
-            poolAddress: poolAddress,
-            owner: address(msg.sender),
-            rewardToken: rewardToken,
-            callerAddress: caller,
-            closed: false,
-            takeProfitPrice: takeProfitPrice
-        });
+        PositionInfo memory position = PositionLib.stake(
+            this,
+            proxyPool.acquire(),
+            positionIndex,
+            stakeParams,
+            swapKind,
+            swapParams
+        );
 
-        stakeViaCaller(positions[lastPositionIndex - 1], amountToStake, stakingSelector);
-        // No rewards to dump
-        return lastPositionIndex - 1;
+        if (address(gelatoOps) != address(0)) {
+            position.gelatoLiquidateTaskId = _gelatoCreateTask(positionIndex);
+            depositGasTank(position.callerAddress);
+        }
+
+        positions[positionIndex] = position;
+        emitPositionWasCreated(positionIndex, position.stakedToken);
+        return positionIndex;
+    }
+
+    function stake(
+        uint inputAmount,
+        IERC20Upgradeable inputToken,
+        uint stakingAmountMin,
+        IERC20Upgradeable stakingToken,
+        address stakingPool,
+        uint maxSlippage,
+        uint stopLossPrice,
+        uint takeProfitPrice,
+        uint swapKind,
+        bytes calldata swapParams
+    ) public payable nonReentrant returns (uint) {
+        return
+            _stakeToken(
+                PositionLib.StakeParams(
+                    inputAmount,
+                    inputToken,
+                    stakingAmountMin,
+                    stakingToken,
+                    stakingPool,
+                    maxSlippage,
+                    stopLossPrice,
+                    takeProfitPrice
+                ),
+                swapKind,
+                swapParams
+            );
+    }
+
+    function stakeToken(
+        IERC20Upgradeable stakingToken,
+        address stakingPool,
+        uint tokenAmount,
+        uint maxSlippage,
+        uint stopLossPrice,
+        uint takeProfitPrice
+    ) public payable nonReentrant returns (uint) {
+        return
+            _stakeToken(
+                PositionLib.StakeParams(
+                    tokenAmount,
+                    stakingToken,
+                    tokenAmount,
+                    stakingToken,
+                    stakingPool,
+                    maxSlippage,
+                    stopLossPrice,
+                    takeProfitPrice
+                ),
+                PositionLib.StakeSimpleKind,
+                ""
+            );
+    }
+
+    function swapStakeToken(
+        IERC20Upgradeable inputToken,
+        IERC20Upgradeable stakingToken,
+        address stakingPool,
+        uint inputTokenAmount,
+        uint stakingTokenAmountMin,
+        uint maxSlippage,
+        uint stopLossPrice,
+        uint takeProfitPrice,
+        bytes memory hints
+    ) public payable nonReentrant returns (uint) {
+        return
+            _stakeToken(
+                PositionLib.StakeParams(
+                    inputTokenAmount,
+                    inputToken,
+                    stakingTokenAmountMin,
+                    stakingToken,
+                    stakingPool,
+                    maxSlippage,
+                    stopLossPrice,
+                    takeProfitPrice
+                ),
+                PositionLib.StakeSwapMarketKind,
+                abi.encode(PositionLib.StakeSwapMarket(hints))
+            );
+    }
+
+    function swapStakeTokenOneInch(
+        IERC20Upgradeable inputToken,
+        IERC20Upgradeable stakingToken,
+        address stakingPool,
+        uint inputTokenAmount,
+        uint maxSlippage,
+        uint stopLossPrice,
+        uint takeProfitPrice,
+        bytes memory oneInchCallData
+    ) public payable nonReentrant returns (uint) {
+        return
+            _stakeToken(
+                PositionLib.StakeParams(
+                    inputTokenAmount,
+                    inputToken,
+                    0,
+                    stakingToken,
+                    stakingPool,
+                    maxSlippage,
+                    stopLossPrice,
+                    takeProfitPrice
+                ),
+                PositionLib.StakeSwapOneInchKind,
+                abi.encode(PositionLib.StakeSwapOneInch(oneInchCallData))
+            );
+    }
+
+    function swapStakeTokenEstimate(
+        address inputToken,
+        address stakingToken,
+        uint inputTokenAmount,
+        bool tokenInPair,
+        bool tokenOutPair
+    ) public view returns (uint amountOut, bytes memory hints) {
+        require(address(market) != address(0), "no market");
+        return market.estimateOut(inputToken, stakingToken, inputTokenAmount);
+    }
+
+    function swapEstimate(
+        address inputToken,
+        address stakingToken,
+        uint inputTokenAmount
+    ) public view returns (uint amountOut, bytes memory hints) {
+        require(address(market) != address(0), "no market");
+        return market.estimateOut(inputToken, stakingToken, inputTokenAmount);
     }
 
     function deposit(uint positionIndex, uint amount) external nonReentrant {
-        bytes4 stakingSelector = DEPOSIT_SELECTOR;
-        if (positions[positionIndex].poolAddress == masterChefAddress) {
-            stakingSelector = ENTER_STAKING_SELECTOR;
-        }
-        depositImpl(positionIndex, amount, stakingSelector);
+        PositionInfo storage position = positions[positionIndex];
+
+        PositionLib.deposit(this, position, positionIndex, amount);
+        emit PositionWasModified(positionIndex);
     }
 
     function setLiquidator(address user, bool value) external onlyOwner {
         isLiquidator[user] = value;
-    }
-
-    function changeStopLossPrice(uint positionIndex, uint newStopLossPrice) external nonReentrant {
-        emit PositionWasModified(positionIndex);
-        PositionInfo storage position = positions[positionIndex];
-        require(position.owner == address(msg.sender), "stop loss may be changed only by position owner");
-        require(newStopLossPrice != 0, "changeStopLossPrice: new price is zero");
-        position.stopLossPrice = newStopLossPrice;
-    }
-
-    function withdrawAll(uint positionIndex) external nonReentrant {
-        PositionInfo storage position = positions[positionIndex];
-        bytes4 withdrawSelector = WITHDRAW_SELECTOR;
-        if (position.poolAddress == masterChefAddress) {
-            withdrawSelector = LEAVE_STAKING_SELECTOR;
-        }
-        withdrawImpl(position, positionIndex, position.stakedAmount, withdrawSelector);
     }
 
     function alterPositionParams(
@@ -290,241 +519,311 @@ contract MinimaxMain is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         uint newSlippage
     ) external nonReentrant {
         PositionInfo storage position = positions[positionIndex];
-        require(position.owner == address(msg.sender), "stop loss may be changed only by position owner");
-        require(newStopLossPrice != 0, "changeStopLossPrice: new price is zero");
-        require(newSlippage != 0, "slippage: new slippage is zero");
-
-        bytes4 depositSelector = DEPOSIT_SELECTOR;
-        bytes4 withdrawSelector = WITHDRAW_SELECTOR;
-        if (position.poolAddress == masterChefAddress) {
-            depositSelector = ENTER_STAKING_SELECTOR;
-            withdrawSelector = LEAVE_STAKING_SELECTOR;
-        }
-
-        position.stopLossPrice = newStopLossPrice;
-        position.takeProfitPrice = newTakeProfitPrice;
-        position.maxSlippage = newSlippage;
-
-        if (newAmount < position.stakedAmount) {
-            uint withdrawAmount = position.stakedAmount.sub(newAmount);
-            withdrawImpl(position, positionIndex, withdrawAmount, withdrawSelector);
-        } else if (newAmount > position.stakedAmount) {
-            uint depositAmount = newAmount.sub(position.stakedAmount);
-            depositImpl(positionIndex, depositAmount, depositSelector);
+        bool shouldClose = PositionLib.alterPositionParams(
+            this,
+            position,
+            positionIndex,
+            newAmount,
+            newStopLossPrice,
+            newTakeProfitPrice,
+            newSlippage
+        );
+        if (shouldClose) {
+            closePosition(positionIndex, ClosePositionReason.WithdrawnByOwner);
         } else {
             emit PositionWasModified(positionIndex);
         }
+    }
+
+    function withdrawImpl(
+        uint positionIndex,
+        uint amount,
+        bool withdrawAll
+    ) private {
+        PositionInfo storage position = positions[positionIndex];
+        bool shouldClose = PositionLib.withdraw(this, position, positionIndex, amount, withdrawAll);
+        if (shouldClose) {
+            closePosition(positionIndex, ClosePositionReason.WithdrawnByOwner);
+        } else {
+            emit PositionWasModified(positionIndex);
+        }
+    }
+
+    function withdrawAll(uint positionIndex) external nonReentrant {
+        withdrawImpl(
+            positionIndex,
+            0, /* amount */
+            true /* withdrawAll */
+        );
+
+        PositionInfo storage position = positions[positionIndex];
+
+        position.callerAddress.transferAll(position.stakedToken, position.owner);
+        position.callerAddress.transferAll(position.rewardToken, position.owner);
     }
 
     function withdraw(uint positionIndex, uint amount) external nonReentrant {
-        PositionInfo storage position = positions[positionIndex];
-        bytes4 withdrawSelector = WITHDRAW_SELECTOR;
-        if (position.poolAddress == masterChefAddress) {
-            withdrawSelector = LEAVE_STAKING_SELECTOR;
-        }
-        withdrawImpl(position, positionIndex, amount, withdrawSelector);
-    }
-
-    function dumpRewards(PositionInfo storage position) private {
-        uint rewardAmount = IBEP20(position.rewardToken).balanceOf(position.callerAddress);
-        if (rewardAmount != 0) {
-            transferTokensViaCaller(position, position.rewardToken, position.owner, rewardAmount);
-        }
-    }
-
-    // Emits `PositionWasClosed` always.
-    function liquidateByIndexImpl(uint positionIndex) private {
-        emit PositionWasClosed(positionIndex);
-
-        bytes4 withdrawSelector = WITHDRAW_SELECTOR;
-        if (positions[positionIndex].poolAddress == masterChefAddress) {
-            withdrawSelector = LEAVE_STAKING_SELECTOR;
-        }
+        withdrawImpl(
+            positionIndex,
+            amount, /* amount */
+            false /* withdrawAll */
+        );
 
         PositionInfo storage position = positions[positionIndex];
-        verifyPositionReadinessForLiquidation(positionIndex);
-        withdrawViaCaller(position, position.stakedAmount, withdrawSelector);
 
-        transferTokensViaCaller(position, cakeAddress, address(this), position.stakedAmount);
-        // Firstly, 'transferTokensViaCaller', then 'dumpRewards': order is important here when (rewardToken == CAKE)
-        dumpRewards(position);
-
-        IPriceOracle cakePriceOracle = IPriceOracle(cakeOracleAddress);
-        uint latestPrice = uint(cakePriceOracle.latestAnswer());
-        finishLiquidationAfterUnstaking(positionIndex, latestPrice);
+        position.callerAddress.transferAll(position.stakedToken, position.owner);
+        position.callerAddress.transferAll(position.rewardToken, position.owner);
     }
 
-    function liquidateByIndex(uint positionIndex) external nonReentrant onlyLiquidator {
-        liquidateByIndexImpl(positionIndex);
-    }
+    function estimateLpPartsForPosition(uint positionIndex) external returns (uint, uint) {
+        PositionInfo storage position = positions[positionIndex];
 
-    // May run out of gas if array length is too big!
-    function liquidateManyByIndex(uint[] calldata positionIndexes) external nonReentrant onlyLiquidator {
-        for (uint i = 0; i < positionIndexes.length; ++i) {
-            liquidateByIndexImpl(positionIndexes[i]);
-        }
-    }
-
-    function returnCaller(address caller) private {
-        availableCallers.push(caller);
-    }
-
-    function approveViaCaller(
-        address caller,
-        address callee,
-        address user,
-        uint allowance
-    ) private {
-        (bool success, bytes memory data) = ProxyCaller(caller).exec(
-            callee,
-            abi.encodeWithSelector(APPROVE_SELECTOR, user, allowance)
+        withdrawImpl(
+            positionIndex,
+            0, /* amount */
+            true /* withdrawAll */
         );
-        require(success && (data.length == 0 || abi.decode(data, (bool))), "approve via caller");
+
+        return PositionLib.estimateLpPartsForPosition(this, position);
     }
 
-    function getAvailableCaller() private returns (address) {
-        if (availableCallers.length == 0) {
-            ProxyCaller caller = new ProxyCaller();
-            return address(caller);
-        }
-        address res = availableCallers[availableCallers.length - 1];
-        availableCallers.pop();
-        return res;
+    struct SlotInfo {
+        uint withdrawnBalance;
+        address lpToken;
+        uint amount0;
+        uint amount1;
+        address token0;
+        address token1;
+        uint amountFirstSwapOut;
+        uint amountSecondSwapOut;
     }
 
-    function stakeViaCaller(
-        PositionInfo storage position,
-        uint amount,
-        bytes4 poolSelector
-    ) private {
-        IBEP20(cakeAddress).safeTransfer(position.callerAddress, amount);
-        approveViaCaller(position.callerAddress, cakeAddress, position.poolAddress, amount);
-        (bool success, bytes memory data) = ProxyCaller(position.callerAddress).exec(
-            position.poolAddress,
-            abi.encodeWithSelector(poolSelector, amount)
-        );
-        require(success && (data.length == 0), "stake via caller");
-    }
-
-    // Emits `PositionsWasModified` always.
-    function depositImpl(
+    function withdrawAllWithSwap(
         uint positionIndex,
-        uint amount,
-        bytes4 depositSelector
-    ) private {
-        emit PositionWasModified(positionIndex);
-
+        address withdrawalToken,
+        bytes memory oneInchCallData
+    ) external nonReentrant {
         PositionInfo storage position = positions[positionIndex];
-        require(position.owner == address(msg.sender), "deposit: only position owner allowed");
-        require(position.closed == false, "deposit: position is closed");
-
-        IBEP20(cakeAddress).safeTransferFrom(address(msg.sender), address(this), amount);
-
-        uint userFeeShare = getUserFee();
-        uint userFeeAmount = amount.mul(userFeeShare).div(FEE_MULTIPLIER);
-        uint amountToDeposit = amount.sub(userFeeAmount);
-
-        position.stakedAmount = (position.stakedAmount).add(amountToDeposit);
-        position.feeAmount = (position.feeAmount).add(userFeeAmount);
-
-        stakeViaCaller(position, amountToDeposit, depositSelector);
-        dumpRewards(position);
-    }
-
-    function transferTokensViaCaller(
-        PositionInfo storage position,
-        address token,
-        address to,
-        uint amount
-    ) private {
-        (bool success, ) = ProxyCaller(position.callerAddress).exec(
-            token,
-            abi.encodeWithSelector(TRANSFER_SELECTOR, to, amount)
+        require(position.stakedToken == position.rewardToken, "withdraw all only for APY");
+        withdrawImpl(
+            positionIndex,
+            0, /* amount */
+            true /* withdrawAll */
         );
-        require(success, "transferTokensViaCaller: send token to owner");
-    }
 
-    function withdrawViaCaller(
-        PositionInfo storage position,
-        uint amount,
-        bytes4 withdrawSelector
-    ) private {
-        (bool success, bytes memory data) = ProxyCaller(position.callerAddress).exec(
-            position.poolAddress,
-            abi.encodeWithSelector(withdrawSelector, amount)
+        uint withdrawnBalance = position.stakedToken.balanceOf(address(position.callerAddress));
+        position.callerAddress.transferAll(position.stakedToken, address(this));
+
+        uint amountOut = PositionLib.makeSwapOneInch(
+            withdrawnBalance,
+            address(position.stakedToken),
+            oneInchRouter,
+            PositionLib.StakeSwapOneInch(oneInchCallData)
         );
-        require(success && (data.length == 0), "withdrawViaCaller: unstaking");
+
+        SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(withdrawalToken), msg.sender, amountOut);
     }
 
-    // Emits:
-    //   * `PositionWasClosed`,   if `amount == position.stakedAmount`.
-    //   * `PositionWasModified`, otherwise.
-    function withdrawImpl(
-        PositionInfo storage position,
+    // TODO: add slippage for swaps
+    function withdrawAllWithSwapLp(
         uint positionIndex,
-        uint amount,
-        bytes4 withdrawSelector
+        address withdrawalToken,
+        bytes memory oneInchCallDataToken0,
+        bytes memory oneInchCallDataToken1
+    ) external nonReentrant {
+        SlotInfo memory slot;
+        PositionInfo storage position = positions[positionIndex];
+        require(position.stakedToken == position.rewardToken, "withdraw all only for APY");
+        withdrawImpl(
+            positionIndex,
+            0, /* amount */
+            true /* withdrawAll */
+        );
+
+        slot.withdrawnBalance = position.stakedToken.balanceOf(address(position.callerAddress));
+        position.callerAddress.transferAll(position.stakedToken, address(this));
+
+        // TODO: when fee of contract is non-zero, then ensure fees from LP-tokens are not burned here
+        slot.lpToken = address(position.stakedToken);
+        IERC20Upgradeable(slot.lpToken).transfer(address(slot.lpToken), slot.withdrawnBalance);
+
+        (slot.amount0, slot.amount1) = IPairToken(slot.lpToken).burn(address(this));
+
+        slot.token0 = IPairToken(slot.lpToken).token0();
+        slot.token1 = IPairToken(slot.lpToken).token1();
+
+        slot.amountFirstSwapOut = PositionLib.makeSwapOneInch(
+            slot.amount0,
+            slot.token0,
+            oneInchRouter,
+            PositionLib.StakeSwapOneInch(oneInchCallDataToken0)
+        );
+
+        slot.amountSecondSwapOut = PositionLib.makeSwapOneInch(
+            slot.amount1,
+            slot.token1,
+            oneInchRouter,
+            PositionLib.StakeSwapOneInch(oneInchCallDataToken1)
+        );
+
+        SafeERC20Upgradeable.safeTransfer(
+            IERC20Upgradeable(withdrawalToken),
+            msg.sender,
+            slot.amountFirstSwapOut + slot.amountSecondSwapOut
+        );
+    }
+
+    // Always emits `PositionWasClosed`
+    function liquidateByIndexImpl(
+        uint positionIndex,
+        uint amountOutMin,
+        bytes memory marketHints
     ) private {
-        require(position.owner == address(msg.sender), "withdraw: only position owner allowed");
-        require(position.closed == false, "withdraw: position is closed");
-        require(amount <= position.stakedAmount, "withdraw: withdraw amount exceeds staked amount");
-        withdrawViaCaller(position, amount, withdrawSelector);
-        transferTokensViaCaller(position, cakeAddress, position.owner, amount);
-        dumpRewards(position);
-
-        if (amount == position.stakedAmount) {
-            emit PositionWasClosed(positionIndex);
-            position.closed = true;
-            returnCaller(position.callerAddress);
-        } else {
-            emit PositionWasModified(positionIndex);
-            position.stakedAmount = (position.stakedAmount).sub(amount);
-        }
-    }
-
-    function verifyPositionReadinessForLiquidation(uint positionIndex) private view returns (uint) {
         PositionInfo storage position = positions[positionIndex];
-        require(position.closed == false, "isPositionReadyForLiquidation: position is closed");
-        require(position.owner != address(0), "position is not created");
+        require(isOpen(position), "isOpen");
 
-        IPriceOracle cakePriceOracle = IPriceOracle(cakeOracleAddress);
-        uint latestPrice = uint(cakePriceOracle.latestAnswer());
-        require(
-            (latestPrice < position.stopLossPrice) || (latestPrice > position.takeProfitPrice),
-            "isPositionReadyForLiquidation: incorrect price level"
+        position.callerAddress.withdrawAll(
+            getPoolAdapterSafe(position.poolAddress),
+            position.poolAddress,
+            abi.encode(position.stakedToken) // pass stakedToken for aave pools
         );
 
-        return latestPrice;
-    }
+        uint stakedAmount = IERC20Upgradeable(position.stakedToken).balanceOf(address(position.callerAddress));
 
-    function finishLiquidationAfterUnstaking(uint positionIndex, uint latestPrice) private {
-        PositionInfo storage position = positions[positionIndex];
-
-        IPancakeRouter dexRouter = IPancakeRouter(cakeRouterAddress);
-
-        // Optimistic conversion BUSD amount
-        uint minAmountOut = position.stakedAmount.mul(latestPrice).div(PRICE_MULTIPLIER);
-        // Accounting slippage
-        minAmountOut = minAmountOut.sub(minAmountOut.mul(position.maxSlippage).div(SLIPPAGE_MULTIPLIER));
-
-        address[] memory path = new address[](2);
-        path[0] = cakeAddress;
-        path[1] = busdAddress;
-
-        IBEP20(cakeAddress).safeIncreaseAllowance(address(cakeRouterAddress), position.stakedAmount);
-
-        dexRouter.swapExactTokensForTokens(
-            position.stakedAmount,
-            minAmountOut,
-            path, /* path */
-            position.owner, /* to */
-            block.timestamp /* deadline */
+        position.callerAddress.approve(position.stakedToken, address(market), stakedAmount);
+        position.callerAddress.swap(
+            market, // adapter
+            address(position.stakedToken), // tokenIn
+            busdAddress, // tokenOut
+            stakedAmount, // amountIn
+            amountOutMin, // amountOutMin
+            positions[positionIndex].owner, // to
+            marketHints // hints
         );
 
-        // Transfer fee to liquidator address
-        IBEP20(cakeAddress).safeTransfer(msg.sender, position.feeAmount);
+        // Firstly, 'transfer', then 'dumpRewards': order is important here when (rewardToken == CAKE)
+        position.callerAddress.transferAll(position.rewardToken, position.owner);
+
+        closePosition(positionIndex, ClosePositionReason.LiquidatedByAutomation);
+    }
+
+    function closePosition(uint positionIndex, ClosePositionReason reason) private {
+        PositionInfo storage position = positions[positionIndex];
 
         position.closed = true;
-        returnCaller(position.callerAddress);
+
+        if (isModernProxy(position.callerAddress)) {
+            withdrawGasTank(position.callerAddress, position.owner);
+            proxyPool.release(position.callerAddress);
+        }
+
+        _gelatoCancelTask(position.gelatoLiquidateTaskId);
+
+        if (reason == ClosePositionReason.WithdrawnByOwner) {
+            emitPositionWasClosed(positionIndex, position.stakedToken);
+        }
+        if (reason == ClosePositionReason.LiquidatedByAutomation) {
+            emitPositionWasLiquidated(positionIndex, position.stakedToken);
+        }
+    }
+
+    function depositGasTank(ProxyCaller proxy) private {
+        address(proxy).call{value: msg.value}("");
+    }
+
+    function withdrawGasTank(ProxyCaller proxy, address owner) private {
+        proxy.transferNativeAll(owner);
+    }
+
+    function isModernProxy(ProxyCaller proxy) public returns (bool) {
+        return address(proxy).code.length == 945;
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // Position events.
+
+    function emitPositionWasCreated(uint positionIndex, IERC20Upgradeable positionStakedToken) private {
+        // TODO(TmLev): Remove once `PositionWasCreatedV2` is stable.
+        emit PositionWasCreated(positionIndex);
+
+        (uint price, uint8 priceDecimals) = PositionLib.estimatePositionStakedTokenPrice(this, positionStakedToken);
+        emit PositionWasCreatedV2(positionIndex, block.timestamp, price, priceDecimals);
+    }
+
+    function emitPositionWasClosed(uint positionIndex, IERC20Upgradeable positionStakedToken) private {
+        // TODO(TmLev): Remove once `PositionWasClosedV2` is stable.
+        emit PositionWasClosed(positionIndex);
+
+        (uint price, uint8 priceDecimals) = PositionLib.estimatePositionStakedTokenPrice(this, positionStakedToken);
+        emit PositionWasClosedV2(positionIndex, block.timestamp, price, priceDecimals);
+    }
+
+    function emitPositionWasLiquidated(uint positionIndex, IERC20Upgradeable positionStakedToken) private {
+        // TODO(TmLev): Remove once `PositionWasLiquidatedV2` is stable.
+        emit PositionWasClosed(positionIndex);
+
+        (uint price, uint8 priceDecimals) = PositionLib.estimatePositionStakedTokenPrice(this, positionStakedToken);
+        emit PositionWasLiquidatedV2(positionIndex, block.timestamp, price, priceDecimals);
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // Gelato
+
+    struct AutomationParams {
+        uint256 positionIndex;
+        uint256 minAmountOut;
+        bytes marketHints;
+    }
+
+    function isOpen(PositionInfo storage position) private view returns (bool) {
+        return !position.closed && position.owner != address(0);
+    }
+
+    function automationResolve(uint positionIndex) public returns (bool canExec, bytes memory execPayload) {
+        PositionInfo storage position = positions[positionIndex];
+        uint256 amountOut;
+        bytes memory hints;
+        (canExec, amountOut, hints) = PositionLib.isOutsideRange(this, position);
+        if (canExec) {
+            uint minAmountOut = amountOut - (amountOut * position.maxSlippage) / SLIPPAGE_MULTIPLIER;
+            AutomationParams memory params = AutomationParams(positionIndex, minAmountOut, hints);
+            execPayload = abi.encodeWithSelector(this.automationExec.selector, abi.encode(params));
+        }
+    }
+
+    function automationExec(bytes calldata raw) public onlyAutomator {
+        AutomationParams memory params = abi.decode(raw, (AutomationParams));
+        gelatoPayFee(params.positionIndex);
+        liquidateByIndexImpl(params.positionIndex, params.minAmountOut, params.marketHints);
+    }
+
+    function gelatoPayFee(uint positionIndex) private {
+        (uint feeAmount, address feeToken) = gelatoOps.getFeeDetails();
+        if (feeAmount == 0) {
+            return;
+        }
+
+        require(feeToken == GelatoNativeToken);
+
+        address feeDestination = gelatoOps.gelato();
+        ProxyCaller proxy = positions[positionIndex].callerAddress;
+        proxy.transferNative(feeDestination, feeAmount);
+    }
+
+    function _gelatoCreateTask(uint positionIndex) private returns (bytes32) {
+        return
+            gelatoOps.createTaskNoPrepayment(
+                address(this), /* execAddress */
+                this.automationExec.selector, /* execSelector */
+                address(this), /* resolverAddress */
+                abi.encodeWithSelector(this.automationResolve.selector, positionIndex), /* resolverData */
+                GelatoNativeToken
+            );
+    }
+
+    function _gelatoCancelTask(bytes32 gelatoTaskId) private {
+        if (address(gelatoOps) != address(0) && gelatoTaskId != "") {
+            gelatoOps.cancelTask(gelatoTaskId);
+        }
     }
 }

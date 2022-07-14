@@ -3,16 +3,14 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
-import "./interfaces/IBEP20.sol";
-import "./helpers/SafeBEP20.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "./interfaces/IMinimaxToken.sol";
 
 contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
     uint public constant SHARE_MULTIPLIER = 1e12;
 
-    using SafeMath for uint;
-    using SafeBEP20 for IBEP20;
+    using SafeERC20Upgradeable for IERC20Upgradeable;
 
     struct UserPoolInfo {
         uint amount; // How many LP tokens the user has provided.
@@ -22,7 +20,7 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
 
     // Info of each pool.
     struct PoolInfo {
-        IBEP20 token; // Address of LP token contract.
+        IERC20Upgradeable token; // Address of LP token contract.
         uint totalSupply;
         uint allocPoint; // How many allocation points assigned to this pool. MINIMAXs to distribute per block.
         uint timeLocked; // How long stake must be locked for
@@ -64,7 +62,7 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         // staking pool
         poolInfo.push(
             PoolInfo({
-                token: IBEP20(minimaxToken),
+                token: IERC20Upgradeable(minimaxToken),
                 totalSupply: 0,
                 allocPoint: 800,
                 timeLocked: 0 days,
@@ -74,7 +72,7 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         );
         poolInfo.push(
             PoolInfo({
-                token: IBEP20(minimaxToken),
+                token: IERC20Upgradeable(minimaxToken),
                 totalSupply: 0,
                 allocPoint: 1400,
                 timeLocked: 7 days,
@@ -84,7 +82,7 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         );
         poolInfo.push(
             PoolInfo({
-                token: IBEP20(minimaxToken),
+                token: IERC20Upgradeable(minimaxToken),
                 totalSupply: 0,
                 allocPoint: 2000,
                 timeLocked: 30 days,
@@ -94,7 +92,7 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         );
         poolInfo.push(
             PoolInfo({
-                token: IBEP20(minimaxToken),
+                token: IERC20Upgradeable(minimaxToken),
                 totalSupply: 0,
                 allocPoint: 3000,
                 timeLocked: 90 days,
@@ -120,11 +118,11 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         // Minting reward
         uint accMinimaxPerShare = pool.accMinimaxPerShare;
         if (block.number > pool.lastRewardBlock && pool.totalSupply != 0) {
-            uint multiplier = (block.number).sub(pool.lastRewardBlock);
-            uint minimaxReward = multiplier.mul(minimaxPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
-            accMinimaxPerShare = accMinimaxPerShare.add(minimaxReward.mul(SHARE_MULTIPLIER).div(pool.totalSupply));
+            uint multiplier = block.number - pool.lastRewardBlock;
+            uint minimaxReward = (multiplier * minimaxPerBlock * pool.allocPoint) / totalAllocPoint;
+            accMinimaxPerShare = accMinimaxPerShare + (minimaxReward * SHARE_MULTIPLIER) / pool.totalSupply;
         }
-        uint pendingUserMinimax = user.amount.mul(accMinimaxPerShare).div(SHARE_MULTIPLIER).sub(user.rewardDebt);
+        uint pendingUserMinimax = (user.amount * accMinimaxPerShare) / SHARE_MULTIPLIER - user.rewardDebt;
         return pendingUserMinimax;
     }
 
@@ -139,11 +137,9 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
             return;
         }
         // Minting reward
-        uint multiplier = (block.number).sub(pool.lastRewardBlock);
-        uint minimaxReward = multiplier.mul(minimaxPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
-        pool.accMinimaxPerShare = pool.accMinimaxPerShare.add(
-            minimaxReward.mul(SHARE_MULTIPLIER).div(pool.totalSupply)
-        );
+        uint multiplier = block.number - pool.lastRewardBlock;
+        uint minimaxReward = (multiplier * minimaxPerBlock * pool.allocPoint) / totalAllocPoint;
+        pool.accMinimaxPerShare = pool.accMinimaxPerShare + (minimaxReward * SHARE_MULTIPLIER) / pool.totalSupply;
         pool.lastRewardBlock = block.number;
     }
 
@@ -160,13 +156,13 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
             uint before = pool.token.balanceOf(address(this));
             pool.token.safeTransferFrom(address(msg.sender), address(this), _amount);
             uint post = pool.token.balanceOf(address(this));
-            uint finalAmount = post.sub(before);
-            user.amount = user.amount.add(finalAmount);
+            uint finalAmount = post - before;
+            user.amount = user.amount + finalAmount;
             user.timeDeposited = block.timestamp;
-            pool.totalSupply = pool.totalSupply.add(finalAmount);
+            pool.totalSupply = pool.totalSupply + finalAmount;
             emit Deposit(msg.sender, _pid, finalAmount);
         }
-        user.rewardDebt = user.amount.mul(pool.accMinimaxPerShare).div(SHARE_MULTIPLIER);
+        user.rewardDebt = (user.amount * pool.accMinimaxPerShare) / SHARE_MULTIPLIER;
     }
 
     // Withdraw LP tokens
@@ -174,17 +170,17 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         PoolInfo storage pool = poolInfo[_pid];
         UserPoolInfo storage user = userPoolInfo[_pid][msg.sender];
         require(user.amount >= _amount, "withdraw: requested amount is high");
-        require(block.timestamp >= user.timeDeposited.add(pool.timeLocked), "can't withdraw before end of lock-up");
+        require(block.timestamp >= user.timeDeposited + pool.timeLocked, "can't withdraw before end of lock-up");
 
         updatePool(_pid);
         _claimPendingMintReward(_pid, msg.sender);
 
         if (_amount > 0) {
-            user.amount = user.amount.sub(_amount);
-            pool.totalSupply = pool.totalSupply.sub(_amount);
+            user.amount = user.amount - _amount;
+            pool.totalSupply = pool.totalSupply - _amount;
             pool.token.safeTransfer(address(msg.sender), _amount);
         }
-        user.rewardDebt = user.amount.mul(pool.accMinimaxPerShare).div(SHARE_MULTIPLIER);
+        user.rewardDebt = (user.amount * pool.accMinimaxPerShare) / SHARE_MULTIPLIER;
         emit Withdraw(msg.sender, _pid, _amount);
     }
 
@@ -192,11 +188,11 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
     function emergencyWithdraw(uint _pid) external nonReentrant {
         PoolInfo storage pool = poolInfo[_pid];
         UserPoolInfo storage user = userPoolInfo[_pid][msg.sender];
-        require(block.timestamp >= user.timeDeposited.add(pool.timeLocked), "time locked");
+        require(block.timestamp >= user.timeDeposited + pool.timeLocked, "time locked");
 
         uint amount = user.amount;
 
-        pool.totalSupply = pool.totalSupply.sub(user.amount);
+        pool.totalSupply = pool.totalSupply - user.amount;
         user.amount = 0;
         user.rewardDebt = 0;
         pool.token.safeTransfer(address(msg.sender), amount);
@@ -220,10 +216,10 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
     ) external onlyOwner {
         massUpdatePools();
         uint lastRewardBlock = block.number > startBlock ? block.number : startBlock;
-        totalAllocPoint = totalAllocPoint.add(_allocPoint);
+        totalAllocPoint = totalAllocPoint + _allocPoint;
         poolInfo.push(
             PoolInfo({
-                token: IBEP20(_poolToken),
+                token: IERC20Upgradeable(_poolToken),
                 totalSupply: 0,
                 allocPoint: _allocPoint,
                 timeLocked: _timeLocked,
@@ -240,7 +236,7 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         uint prevAllocPoint = poolInfo[_pid].allocPoint;
         poolInfo[_pid].allocPoint = _allocPoint;
         if (prevAllocPoint != _allocPoint) {
-            totalAllocPoint = totalAllocPoint.sub(prevAllocPoint).add(_allocPoint);
+            totalAllocPoint = totalAllocPoint - prevAllocPoint + _allocPoint;
         }
         emit SetPool(_pid, _allocPoint);
     }
@@ -254,7 +250,7 @@ contract MinimaxStaking is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         PoolInfo storage pool = poolInfo[_pid];
         UserPoolInfo storage user = userPoolInfo[_pid][_user];
 
-        uint pendingMintReward = user.amount.mul(pool.accMinimaxPerShare).div(SHARE_MULTIPLIER).sub(user.rewardDebt);
+        uint pendingMintReward = (user.amount * pool.accMinimaxPerShare) / SHARE_MULTIPLIER - user.rewardDebt;
         if (pendingMintReward > 0) {
             IMinimaxToken(minimaxToken).mint(_user, pendingMintReward);
         }

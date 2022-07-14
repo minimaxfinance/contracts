@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "./helpers/BEP20.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "./helpers/BEP20.sol";
 
 // MinimaxToken with Governance.
 contract MinimaxToken is BEP20("Minimax Token", "MMX") {
     using SafeMath for uint256;
-
     uint public constant MAX_SUPPLY = 100000000 * 1e18;
 
     mapping(address => bool) public isMinter;
@@ -56,10 +55,10 @@ contract MinimaxToken is BEP20("Minimax Token", "MMX") {
 
     // @dev Creates `_amount` token to `_to`. Must only be called by the owner (MasterChef).
     function mint(address _to, uint256 _amount) external {
-        require(totalSupply().add(_amount) <= MAX_SUPPLY, "MAX_SUPPLY");
+        require(totalSupply() + _amount <= MAX_SUPPLY, "MAX_SUPPLY");
         require(isMinter[msg.sender], "NOT_MINTER");
         require(_amount <= mintAmount[msg.sender], "MINT_AMOUNT_EXCEEDED");
-        mintAmount[msg.sender] = mintAmount[msg.sender].sub(_amount);
+        mintAmount[msg.sender] = mintAmount[msg.sender] - _amount;
         _mint(_to, _amount);
         _moveDelegates(address(0), _delegates[_to], _amount);
     }
@@ -206,7 +205,7 @@ contract MinimaxToken is BEP20("Minimax Token", "MMX") {
                 // decrease old representative
                 uint32 srcRepNum = numCheckpoints[srcRep];
                 uint256 srcRepOld = srcRepNum > 0 ? checkpoints[srcRep][srcRepNum - 1].votes : 0;
-                uint256 srcRepNew = srcRepOld.sub(amount);
+                uint256 srcRepNew = srcRepOld - amount;
                 _writeCheckpoint(srcRep, srcRepNum, srcRepOld, srcRepNew);
             }
 
@@ -214,7 +213,7 @@ contract MinimaxToken is BEP20("Minimax Token", "MMX") {
                 // increase new representative
                 uint32 dstRepNum = numCheckpoints[dstRep];
                 uint256 dstRepOld = dstRepNum > 0 ? checkpoints[dstRep][dstRepNum - 1].votes : 0;
-                uint256 dstRepNew = dstRepOld.add(amount);
+                uint256 dstRepNew = dstRepOld + amount;
                 _writeCheckpoint(dstRep, dstRepNum, dstRepOld, dstRepNew);
             }
         }

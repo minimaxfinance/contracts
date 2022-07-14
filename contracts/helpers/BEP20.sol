@@ -174,7 +174,7 @@ contract BEP20 is Context, IBEP20, Ownable {
      * - `spender` cannot be the zero address.
      */
     function increaseAllowance(address spender, uint256 addedValue) public returns (bool) {
-        _approve(_msgSender(), spender, _allowances[_msgSender()][spender].add(addedValue));
+        _approve(_msgSender(), spender, _allowances[_msgSender()][spender] + addedValue);
         return true;
     }
 
@@ -224,7 +224,7 @@ contract BEP20 is Context, IBEP20, Ownable {
         require(recipient != address(0), "BEP20: transfer to the zero address");
 
         _balances[sender] = _balances[sender].sub(amount, "BEP20: transfer amount exceeds balance");
-        _balances[recipient] = _balances[recipient].add(amount);
+        _balances[recipient] = _balances[recipient] + amount;
         emit Transfer(sender, recipient, amount);
     }
 
@@ -240,8 +240,8 @@ contract BEP20 is Context, IBEP20, Ownable {
     function _mint(address account, uint256 amount) internal {
         require(account != address(0), "BEP20: mint to the zero address");
 
-        _totalSupply = _totalSupply.add(amount);
-        _balances[account] = _balances[account].add(amount);
+        _totalSupply = _totalSupply + amount;
+        _balances[account] = _balances[account] + amount;
         emit Transfer(address(0), account, amount);
     }
 
@@ -260,7 +260,7 @@ contract BEP20 is Context, IBEP20, Ownable {
         require(account != address(0), "BEP20: burn from the zero address");
 
         _balances[account] = _balances[account].sub(amount, "BEP20: burn amount exceeds balance");
-        _totalSupply = _totalSupply.sub(amount);
+        _totalSupply = _totalSupply - amount;
         emit Transfer(account, address(0), amount);
     }
 
